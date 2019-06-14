@@ -1126,7 +1126,7 @@ func handleGetBlock(s *rpcServer, cmd interface{}, closeChan <-chan struct{}) (i
 		PreviousHash:  blockHeader.PrevBlock.String(),
 		Nonce:         blockHeader.Nonce,
 		Time:          blockHeader.Timestamp.Unix(),
-		Confirmations: uint64(1 + best.Height - blockHeight),
+		Confirmations: int64(1 + best.Height - blockHeight),
 		Height:        int64(blockHeight),
 		Size:          int32(len(blkBytes)),
 		StrippedSize:  int32(blk.MsgBlock().SerializeSizeStripped()),
@@ -1320,7 +1320,7 @@ func handleGetBlockHeader(s *rpcServer, cmd interface{}, closeChan <-chan struct
 	if err != nil {
 		return nil, rpcDecodeHexError(c.Hash)
 	}
-	blockHeader, err := s.cfg.Chain.FetchHeader(hash)
+	blockHeader, err := s.cfg.Chain.HeaderByHash(hash)
 	if err != nil {
 		return nil, &btcjson.RPCError{
 			Code:    btcjson.ErrRPCBlockNotFound,
@@ -1364,7 +1364,7 @@ func handleGetBlockHeader(s *rpcServer, cmd interface{}, closeChan <-chan struct
 	params := s.cfg.ChainParams
 	blockHeaderReply := btcjson.GetBlockHeaderVerboseResult{
 		Hash:          c.Hash,
-		Confirmations: uint64(1 + best.Height - blockHeight),
+		Confirmations: int64(1 + best.Height - blockHeight),
 		Height:        blockHeight,
 		Version:       blockHeader.Version,
 		VersionHex:    fmt.Sprintf("%08x", blockHeader.Version),
@@ -2442,7 +2442,7 @@ func handleGetNetworkHashPS(s *rpcServer, cmd interface{}, closeChan <-chan stru
 		}
 
 		// Fetch the header from chain.
-		header, err := s.cfg.Chain.FetchHeader(hash)
+		header, err := s.cfg.Chain.HeaderByHash(hash)
 		if err != nil {
 			context := "Failed to fetch block header"
 			return nil, internalRPCError(err.Error(), context)
@@ -2634,7 +2634,7 @@ func handleGetRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan str
 	var chainHeight int32
 	if blkHash != nil {
 		// Fetch the header from chain.
-		header, err := s.cfg.Chain.FetchHeader(blkHash)
+		header, err := s.cfg.Chain.HeaderByHash(blkHash)
 		if err != nil {
 			context := "Failed to fetch block header"
 			return nil, internalRPCError(err.Error(), context)
@@ -3262,7 +3262,7 @@ func handleSearchRawTransactions(s *rpcServer, cmd interface{}, closeChan <-chan
 		var blkHeight int32
 		if blkHash := rtx.blkHash; blkHash != nil {
 			// Fetch the header from chain.
-			header, err := s.cfg.Chain.FetchHeader(blkHash)
+			header, err := s.cfg.Chain.HeaderByHash(blkHash)
 			if err != nil {
 				return nil, &btcjson.RPCError{
 					Code:    btcjson.ErrRPCBlockNotFound,
@@ -3323,19 +3323,44 @@ func handleSendRawTransaction(s *rpcServer, cmd interface{}, closeChan <-chan st
 	if err != nil {
 		// When the error is a rule error, it means the transaction was
 		// simply rejected as opposed to something actually going wrong,
-		// so log it as such.  Otherwise, something really did go wrong,
-		// so log it as an actual error.  In both cases, a JSON-RPC
-		// error is returned to the client with the deserialization
-		// error code (to match bitcoind behavior).
-		if _, ok := err.(mempool.RuleError); ok {
-			rpcsLog.Debugf("Rejected transaction %v: %v", tx.Hash(),
-				err)
-		} else {
+		// so log it as such. Otherwise, something really did go wrong,
+		// so log it as an actual error and return.
+		ruleErr, ok := err.(mempool.RuleError)
+		if !ok {
 			rpcsLog.Errorf("Failed to process transaction %v: %v",
 				tx.Hash(), err)
+
+			return nil, &btcjson.RPCError{
+				Code:    btcjson.ErrRPCTxError,
+				Message: "TX rejected: " + err.Error(),
+			}
 		}
+
+		rpcsLog.Debugf("Rejected transaction %v: %v", tx.Hash(), err)
+
+		// We'll then map the rule error to the appropriate RPC error,
+		// matching bitcoind's behavior.
+		code := btcjson.ErrRPCTxError
+		if txRuleErr, ok := ruleErr.Err.(mempool.TxRuleError); ok {
+			errDesc := txRuleErr.Description
+			switch {
+			case strings.Contains(
+				strings.ToLower(errDesc), "orphan transaction",
+			):
+				code = btcjson.ErrRPCTxError
+
+			case strings.Contains(
+				strings.ToLower(errDesc), "transaction already exists",
+			):
+				code = btcjson.ErrRPCTxAlreadyInChain
+
+			default:
+				code = btcjson.ErrRPCTxRejected
+			}
+		}
+
 		return nil, &btcjson.RPCError{
-			Code:    btcjson.ErrRPCDeserialization,
+			Code:    code,
 			Message: "TX rejected: " + err.Error(),
 		}
 	}
@@ -4281,7 +4306,7 @@ func newRPCServer(config *rpcserverConfig) (*rpcServer, error) {
 		gbtWorkState:           newGbtWorkState(config.TimeSource),
 		helpCacher:             newHelpCacher(),
 		requestProcessShutdown: make(chan struct{}),
-		quit: make(chan int),
+		quit:                   make(chan int),
 	}
 	if cfg.RPCUser != "" && cfg.RPCPass != "" {
 		login := cfg.RPCUser + ":" + cfg.RPCPass
